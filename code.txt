@@ -1,0 +1,263 @@
+# %% [code]
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load in 
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+import pickle
+from gensim.models import word2vec
+from sklearn.model_selection import StratifiedKFold
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn import metrics
+
+# %% [code]
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(device)
+cpu_device = torch.device("cpu")
+
+# %% [code]
+class Config():
+    """配置参数"""
+    train_path = "../input/word_train.csv"   # 训练文件
+    test_path = "../input/word_test.csv"     # 测试文件
+    vocabulary_path = "../input/word_vocabulary.pkl"  # 词汇表文件
+    word2vec_path = "../input/word_gensim-word2vec-200.model"  # 词向量文件
+    
+    title_maxlen = 20   # title的最大词长度
+    content_maxlen = 400  # content的最大词长度
+    
+    EPOCH = 20         # 迭代次数
+    BATCH_SIZE = 64   # 批处理大小
+    n_splits = 5    # 交叉验证折数
+    
+    show_batch = 20  # 在整个训练中 每show_batch显示一次训练集和验证集的分数
+    model_path = "model.ckpt"  # 模型暂存路径
+    require_improvement = 10 * show_batch
+    
+config = Config()
+
+# %% [code]
+train = pd.read_csv(open(config.train_path, "r", encoding="utf-8"))  # id, aid, rid, level, rtitle_words, rcontent_words, atitle_words, acontent_words
+test = pd.read_csv(open(config.test_path, "r", encoding="utf-8"))    # id, aid, rid, level, rtitle_words, rcontent_words, atitle_words, acontent_words
+vocabulary = pickle.load(open(config.vocabulary_path, "rb"))
+word2vec_model = word2vec.Word2Vec.load(config.word2vec_path)
+
+# %% [code]
+def sequence2vector(sequence, maxlen):
+    """将文本转为词语序"""
+    vec = np.zeros(maxlen)
+    words = str(sequence).split(" ")
+    index = 0
+    for word in words[:maxlen]:
+        if word in vocabulary.keys():
+            vec[index] = vocabulary[word]
+            index += 1
+    return vec
+
+def load_embedding_matrix():
+    """生成词向量矩阵  (len(vocabulary) + 1, 200)"""
+    embedding_matrix = np.zeros((len(vocabulary) + 1, 200))
+    for word, index in vocabulary.items():
+        embedding_matrix[index] = word2vec_model[word]
+    return embedding_matrix
+
+# %% [code]
+train['rtitle_words'] = train['rtitle_words'].apply(lambda x : sequence2vector(x, config.title_maxlen))
+train['rcontent_words'] = train['rcontent_words'].apply(lambda x : sequence2vector(x, config.content_maxlen))
+train['atitle_words'] = train['atitle_words'].apply(lambda x : sequence2vector(x, config.title_maxlen))
+train['acontent_words'] = train['acontent_words'].apply(lambda x : sequence2vector(x, config.content_maxlen))
+test['rtitle_words'] = test['rtitle_words'].apply(lambda x : sequence2vector(x, config.title_maxlen))
+test['rcontent_words'] = test['rcontent_words'].apply(lambda x : sequence2vector(x, config.content_maxlen))
+test['atitle_words'] = test['atitle_words'].apply(lambda x : sequence2vector(x, config.title_maxlen))
+test['acontent_words'] = test['acontent_words'].apply(lambda x : sequence2vector(x, config.content_maxlen))
+
+# %% [code]
+embedding_matrix = load_embedding_matrix()
+
+# %% [code]
+def getBatch(batch_size, rtitles, rcontents, atitles, acontents, labels=None, shuffle=True):
+    """批数据生成器"""
+    
+    # 打乱数据
+    if shuffle:
+        if labels is not None:
+            tmp = list(zip(rtitles, rcontents, atitles, acontents, labels))
+            random.shuffle(tmp)
+            rtitles[:], rcontents[:], atitles[:], acontents[:], labels[:] = zip(*tmp)
+        else:
+            tmp = list(zip(rtitles, rcontents, atitles, acontents))
+            random.shuffle(tmp)
+            rtitles[:], rcontents[:], atitles[:], acontents[:] = zip(*tmp)
+    
+    sindex = 0
+    eindex = batch_size
+    while eindex < len(rtitles):
+        batch1 = torch.LongTensor(rtitles[sindex: eindex])
+        batch2 = torch.LongTensor(rcontents[sindex: eindex])
+        batch3 = torch.LongTensor(atitles[sindex: eindex])
+        batch4 = torch.LongTensor(acontents[sindex: eindex])
+        batch5 = None
+        if labels is not None:
+            batch5 = torch.LongTensor(labels[sindex: eindex])
+    
+        temp = eindex
+        eindex = eindex + batch_size
+        sindex = temp
+        
+        if labels is not None:
+            yield (batch1, batch2, batch3, batch4, batch5)
+        else:
+            yield (batch1, batch2, batch3, batch4)
+    
+    if eindex >= len(rtitles):
+        batch1 = torch.LongTensor(rtitles[sindex: eindex])
+        batch2 = torch.LongTensor(rcontents[sindex: eindex])
+        batch3 = torch.LongTensor(atitles[sindex: eindex])
+        batch4 = torch.LongTensor(acontents[sindex: eindex])
+        batch5 = None
+        if labels is not None:
+            batch5 = torch.LongTensor(labels[sindex: eindex])
+            
+        if labels is not None:
+            yield (batch1, batch2, batch3, batch4, batch5)
+        else:
+            yield (batch1, batch2, batch3, batch4)
+
+# %% [code]
+class CNNModel(nn.Module):
+    
+    def __init__(self, embedding_dim, output_size, kernel_dim=100, kernel_sizes=(3, 4, 5), dropout=0.5):
+        super(CNNModel,self).__init__()
+        self.embedding = nn.Embedding.from_pretrained(torch.FloatTensor(embedding_matrix))
+        self.fc1 = nn.Linear(embedding_dim * 2, 200)
+        self.fc2 = nn.Linear(200, output_size)
+
+    def forward(self, rtitles, rcontents, atitles, acontents):  # (bs, maxlen)
+        rtitles = self.embedding(rtitles)   #(bs, maxlen, embedding_dim)
+        rcontents = self.embedding(rcontents)
+        atitles = self.embedding(atitles)
+        acontents = self.embedding(acontents)
+        
+        rtitles = torch.mean(rtitles, 1)  #(bs, embedding_dim)
+        rcontents = torch.mean(rcontents, 1)
+        atitles = torch.mean(atitles, 1)
+        acontents = torch.mean(acontents, 1)
+        
+        titles = torch.mul(rtitles, atitles)  # (bs, embedding_dim)
+        contents = torch.mul(rcontents, acontents)
+        
+        x = torch.cat((titles, titles), 1)  # (bs, embedding_dim*2)  连接
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+# %% [code]
+def evaluate(model, rtitles, rcontents, atitles, acontents, labels):
+    """在验证集上进行测试"""
+    predict_labels = []
+    true_labels = []
+    with torch.no_grad():
+        for i, batch in enumerate(getBatch(config.BATCH_SIZE, rtitles, rcontents, atitles, acontents, labels)):
+            outputs = model(batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device))
+            predic = torch.max(outputs.data, 1)[1]
+            predict_labels.extend(predic.to(cpu_device))
+            true_labels.extend(batch[4])
+    return metrics.accuracy_score(true_labels, predict_labels)
+
+def predict(model, rtitles, rcontents, atitles, acontents):
+    """预测测试集"""
+    pres = []
+    with torch.no_grad():
+        for i, batch in enumerate(getBatch(config.BATCH_SIZE, rtitles, rcontents, atitles, acontents, shuffle=False)):
+            outputs = model(batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device))
+            pres.extend(list(outputs.to(cpu_device).numpy()))
+    return np.array(pres)
+
+
+def to_result(stack_test, data):
+    labels = np.argmax(stack_test, axis=1)
+    labels += 1
+    data['level'] = labels
+    data[['id', 'level']].to_csv("submit.csv", index=None, encoding="utf-8")
+
+# %% [code]
+
+stack_test = np.zeros((test.shape[0], 4))
+stack_train = np.zeros((train.shape[0], 4))
+
+sfolder = StratifiedKFold(n_splits=config.n_splits, random_state=0, shuffle=True)
+for i, (tr, va) in enumerate(sfolder.split(train['rtitle_words'], train['level'])):
+    print('stack:%d/%d' % ((i + 1), config.n_splits))
+    
+    # 训练集
+    train_rtitles = [train['rtitle_words'][index] for index in tr]
+    train_rcontents = [train['rcontent_words'][index] for index in tr]
+    train_atitles = [train['atitle_words'][index] for index in tr]
+    train_acontents = [train['acontent_words'][index] for index in tr]
+    train_label = [train['level'][index] - 1 for index in tr]
+    
+    # 验证集
+    test_rtitles = [train['rtitle_words'][index] for index in va]
+    test_rcontents = [train['rcontent_words'][index] for index in va]
+    test_atitles = [train['atitle_words'][index] for index in va]
+    test_acontents = [train['acontent_words'][index] for index in va]
+    test_label = [train['level'][index] - 1 for index in va]
+    
+    
+    # 定义模型
+    model = CNNModel(200, 4)
+    model.to(device)
+    loss_function = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    total_batch = 0
+    val_best = 0  # 验证集最好分数
+    last_improve = 0  # 上一次有提升的total_batch
+    flag = False  # 早停的标志
+    
+    for epoch in range(1, 1 + config.EPOCH):   # 迭代
+        if flag == True:
+            break
+        for j, batch in enumerate(getBatch(config.BATCH_SIZE, train_rtitles, train_rcontents, train_atitles, train_acontents, train_label)):
+            total_batch += 1
+            
+            optimizer.zero_grad()
+            
+            # forward + backward + optimize
+            outputs = model(batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device))
+            loss = loss_function(outputs, batch[4].to(device))
+            loss.backward()
+            optimizer.step()
+            
+            if total_batch % config.show_batch == 0:
+                val_acc = evaluate(model, test_rtitles, test_rcontents, test_atitles, test_acontents, test_label)
+                print("val_acc : " + str(val_acc)) 
+                if val_acc > val_best:
+                    val_best = val_acc
+                    last_improve = total_batch
+                    # 暂存模型
+                    torch.save(model.state_dict(), config.model_path)
+                
+                if total_batch - last_improve >= config.require_improvement:
+                    print("No optimization for a long time, auto-stopping...")
+                    flag = True
+                    break
+                
+    """结束一折的训练做的事情"""
+    model.load_state_dict(torch.load(config.model_path))
+    stack_test += predict(model, list(test['rtitle_words']), list(test['rcontent_words']), list(test['atitle_words']), list(test['acontent_words']))
+    stack_train[va] += predict(model, test_rtitles, test_rcontents, test_atitles, test_acontents)
+    print('stack [{}/{}] 最好的分数：{}'.format(i+1, config.n_splits, val_best))
+    
+# 保存并生成结果
+stack_test /= config.n_splits
+to_result(stack_test, test)
+np.save("stack_train.npy", stack_train)
+np.save("stack_test.npy", stack_test)
+print("数据保存成功！")
